@@ -18,6 +18,7 @@ package compose
 
 import (
 	"context"
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -86,9 +87,11 @@ func TestSimpleCheckPoint(t *testing.T) {
 	info, ok := ExtractInterruptInfo(err)
 	assert.True(t, ok)
 	assert.Equal(t, &InterruptInfo{
-		State:       &testStruct{A: ""},
-		BeforeNodes: []string{"2"},
-		AfterNodes:  []string{"1"},
+		State:           &testStruct{A: ""},
+		BeforeNodes:     []string{"2"},
+		AfterNodes:      []string{"1"},
+		RerunNodesExtra: make(map[string]interface{}),
+		SubGraphs:       make(map[string]*InterruptInfo),
 	}, info)
 
 	result, err := r.Invoke(ctx, "start", WithCheckPointID("1"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
@@ -104,9 +107,11 @@ func TestSimpleCheckPoint(t *testing.T) {
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
 	assert.Equal(t, &InterruptInfo{
-		State:       &testStruct{A: ""},
-		BeforeNodes: []string{"2"},
-		AfterNodes:  []string{"1"},
+		State:           &testStruct{A: ""},
+		BeforeNodes:     []string{"2"},
+		AfterNodes:      []string{"1"},
+		RerunNodesExtra: make(map[string]interface{}),
+		SubGraphs:       make(map[string]*InterruptInfo),
 	}, info)
 
 	streamResult, err := r.Stream(ctx, "start", WithCheckPointID("2"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
@@ -129,7 +134,7 @@ func TestSimpleCheckPoint(t *testing.T) {
 }
 
 func TestCustomStructInAny(t *testing.T) {
-	RegisterSerializableType[testStruct]("test_struct")
+	_ = RegisterSerializableType[testStruct]("test_struct")
 	store := newInMemoryStore()
 	g := NewGraph[string, string](WithGenLocalState(func(ctx context.Context) (state *testStruct) {
 		return &testStruct{A: ""}
@@ -162,8 +167,10 @@ func TestCustomStructInAny(t *testing.T) {
 	info, ok := ExtractInterruptInfo(err)
 	assert.True(t, ok)
 	assert.Equal(t, &InterruptInfo{
-		State:      &testStruct{A: ""},
-		AfterNodes: []string{"1"},
+		State:           &testStruct{A: ""},
+		AfterNodes:      []string{"1"},
+		RerunNodesExtra: make(map[string]interface{}),
+		SubGraphs:       make(map[string]*InterruptInfo),
 	}, info)
 	result, err := r.Invoke(ctx, "start", WithCheckPointID("1"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
 		assert.Equal(t, 0, len(path.path))
@@ -178,8 +185,10 @@ func TestCustomStructInAny(t *testing.T) {
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
 	assert.Equal(t, &InterruptInfo{
-		State:      &testStruct{A: ""},
-		AfterNodes: []string{"1"},
+		State:           &testStruct{A: ""},
+		AfterNodes:      []string{"1"},
+		RerunNodesExtra: make(map[string]interface{}),
+		SubGraphs:       make(map[string]*InterruptInfo),
 	}, info)
 
 	streamResult, err := r.Stream(ctx, "start", WithCheckPointID("2"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
@@ -253,10 +262,13 @@ func TestSubGraph(t *testing.T) {
 	info, ok := ExtractInterruptInfo(err)
 	assert.True(t, ok)
 	assert.Equal(t, &InterruptInfo{
+		RerunNodesExtra: map[string]any{},
 		SubGraphs: map[string]*InterruptInfo{
 			"2": {
-				State:      &testStruct{A: ""},
-				AfterNodes: []string{"1"},
+				State:           &testStruct{A: ""},
+				AfterNodes:      []string{"1"},
+				RerunNodesExtra: make(map[string]interface{}),
+				SubGraphs:       make(map[string]*InterruptInfo),
 			},
 		},
 	}, info)
@@ -273,10 +285,13 @@ func TestSubGraph(t *testing.T) {
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
 	assert.Equal(t, &InterruptInfo{
+		RerunNodesExtra: make(map[string]interface{}),
 		SubGraphs: map[string]*InterruptInfo{
 			"2": {
-				State:      &testStruct{A: ""},
-				AfterNodes: []string{"1"},
+				State:           &testStruct{A: ""},
+				AfterNodes:      []string{"1"},
+				RerunNodesExtra: map[string]any{},
+				SubGraphs:       map[string]*InterruptInfo{},
 			},
 		},
 	}, info)
@@ -433,10 +448,13 @@ func TestNestedSubGraph(t *testing.T) {
 	info, ok := ExtractInterruptInfo(err)
 	assert.True(t, ok)
 	assert.Equal(t, &InterruptInfo{
+		RerunNodesExtra: make(map[string]interface{}),
 		SubGraphs: map[string]*InterruptInfo{
 			"2": {
-				State:      &testStruct{A: ""},
-				AfterNodes: []string{"1"},
+				State:           &testStruct{A: ""},
+				AfterNodes:      []string{"1"},
+				RerunNodesExtra: make(map[string]interface{}),
+				SubGraphs:       make(map[string]*InterruptInfo),
 			},
 		},
 	}, info)
@@ -450,14 +468,18 @@ func TestNestedSubGraph(t *testing.T) {
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
 	assert.Equal(t, &InterruptInfo{
+		RerunNodesExtra: make(map[string]interface{}),
 		SubGraphs: map[string]*InterruptInfo{
 			"2": {
-				State:      &testStruct{A: "state"},
-				AfterNodes: []string{"3"},
+				State:           &testStruct{A: "state"},
+				AfterNodes:      []string{"3"},
+				RerunNodesExtra: make(map[string]interface{}),
 				SubGraphs: map[string]*InterruptInfo{
 					"2": {
-						State:      &testStruct{A: ""},
-						AfterNodes: []string{"1"},
+						State:           &testStruct{A: ""},
+						AfterNodes:      []string{"1"},
+						RerunNodesExtra: make(map[string]interface{}),
+						SubGraphs:       make(map[string]*InterruptInfo),
 					},
 				},
 			},
@@ -477,10 +499,13 @@ func TestNestedSubGraph(t *testing.T) {
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
 	assert.Equal(t, &InterruptInfo{
+		RerunNodesExtra: make(map[string]interface{}),
 		SubGraphs: map[string]*InterruptInfo{
 			"2": {
-				State:       &testStruct{A: "state"},
-				BeforeNodes: []string{"4"},
+				State:           &testStruct{A: "state"},
+				BeforeNodes:     []string{"4"},
+				RerunNodesExtra: make(map[string]interface{}),
+				SubGraphs:       make(map[string]*InterruptInfo),
 			},
 		},
 	}, info)
@@ -500,10 +525,13 @@ state24
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
 	assert.Equal(t, &InterruptInfo{
+		RerunNodesExtra: make(map[string]interface{}),
 		SubGraphs: map[string]*InterruptInfo{
 			"2": {
-				State:      &testStruct{A: ""},
-				AfterNodes: []string{"1"},
+				State:           &testStruct{A: ""},
+				AfterNodes:      []string{"1"},
+				RerunNodesExtra: make(map[string]interface{}),
+				SubGraphs:       make(map[string]*InterruptInfo),
 			},
 		},
 	}, info)
@@ -517,14 +545,18 @@ state24
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
 	assert.Equal(t, &InterruptInfo{
+		RerunNodesExtra: make(map[string]interface{}),
 		SubGraphs: map[string]*InterruptInfo{
 			"2": {
-				State:      &testStruct{A: "state"},
-				AfterNodes: []string{"3"},
+				State:           &testStruct{A: "state"},
+				AfterNodes:      []string{"3"},
+				RerunNodesExtra: make(map[string]interface{}),
 				SubGraphs: map[string]*InterruptInfo{
 					"2": {
-						State:      &testStruct{A: ""},
-						AfterNodes: []string{"1"},
+						State:           &testStruct{A: ""},
+						AfterNodes:      []string{"1"},
+						RerunNodesExtra: make(map[string]interface{}),
+						SubGraphs:       make(map[string]*InterruptInfo),
 					},
 				},
 			},
@@ -544,10 +576,13 @@ state24
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
 	assert.Equal(t, &InterruptInfo{
+		RerunNodesExtra: make(map[string]interface{}),
 		SubGraphs: map[string]*InterruptInfo{
 			"2": {
-				State:       &testStruct{A: "state"},
-				BeforeNodes: []string{"4"},
+				State:           &testStruct{A: "state"},
+				BeforeNodes:     []string{"4"},
+				RerunNodesExtra: make(map[string]interface{}),
+				SubGraphs:       make(map[string]*InterruptInfo),
 			},
 		},
 	}, info)
@@ -586,10 +621,13 @@ state24
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
 	assert.Equal(t, &InterruptInfo{
+		RerunNodesExtra: make(map[string]interface{}),
 		SubGraphs: map[string]*InterruptInfo{
 			"2": {
-				State:      &testStruct{A: ""},
-				AfterNodes: []string{"1"},
+				State:           &testStruct{A: ""},
+				AfterNodes:      []string{"1"},
+				RerunNodesExtra: make(map[string]interface{}),
+				SubGraphs:       make(map[string]*InterruptInfo),
 			},
 		},
 	}, info)
@@ -603,14 +641,18 @@ state24
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
 	assert.Equal(t, &InterruptInfo{
+		RerunNodesExtra: make(map[string]interface{}),
 		SubGraphs: map[string]*InterruptInfo{
 			"2": {
-				State:      &testStruct{A: "state"},
-				AfterNodes: []string{"3"},
+				State:           &testStruct{A: "state"},
+				AfterNodes:      []string{"3"},
+				RerunNodesExtra: make(map[string]interface{}),
 				SubGraphs: map[string]*InterruptInfo{
 					"2": {
-						State:      &testStruct{A: ""},
-						AfterNodes: []string{"1"},
+						State:           &testStruct{A: ""},
+						AfterNodes:      []string{"1"},
+						RerunNodesExtra: make(map[string]interface{}),
+						SubGraphs:       make(map[string]*InterruptInfo),
 					},
 				},
 			},
@@ -630,10 +672,13 @@ state24
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
 	assert.Equal(t, &InterruptInfo{
+		RerunNodesExtra: make(map[string]interface{}),
 		SubGraphs: map[string]*InterruptInfo{
 			"2": {
-				State:       &testStruct{A: "state"},
-				BeforeNodes: []string{"4"},
+				State:           &testStruct{A: "state"},
+				BeforeNodes:     []string{"4"},
+				RerunNodesExtra: make(map[string]interface{}),
+				SubGraphs:       make(map[string]*InterruptInfo),
 			},
 		},
 	}, info)
@@ -653,10 +698,13 @@ state24
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
 	assert.Equal(t, &InterruptInfo{
+		RerunNodesExtra: make(map[string]interface{}),
 		SubGraphs: map[string]*InterruptInfo{
 			"2": {
-				State:      &testStruct{A: ""},
-				AfterNodes: []string{"1"},
+				State:           &testStruct{A: ""},
+				AfterNodes:      []string{"1"},
+				RerunNodesExtra: make(map[string]interface{}),
+				SubGraphs:       make(map[string]*InterruptInfo),
 			},
 		},
 	}, info)
@@ -670,14 +718,18 @@ state24
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
 	assert.Equal(t, &InterruptInfo{
+		RerunNodesExtra: make(map[string]interface{}),
 		SubGraphs: map[string]*InterruptInfo{
 			"2": {
-				State:      &testStruct{A: "state"},
-				AfterNodes: []string{"3"},
+				State:           &testStruct{A: "state"},
+				AfterNodes:      []string{"3"},
+				RerunNodesExtra: make(map[string]interface{}),
 				SubGraphs: map[string]*InterruptInfo{
 					"2": {
-						State:      &testStruct{A: ""},
-						AfterNodes: []string{"1"},
+						State:           &testStruct{A: ""},
+						AfterNodes:      []string{"1"},
+						RerunNodesExtra: make(map[string]interface{}),
+						SubGraphs:       make(map[string]*InterruptInfo),
 					},
 				},
 			},
@@ -697,10 +749,13 @@ state24
 	info, ok = ExtractInterruptInfo(err)
 	assert.True(t, ok)
 	assert.Equal(t, &InterruptInfo{
+		RerunNodesExtra: make(map[string]interface{}),
 		SubGraphs: map[string]*InterruptInfo{
 			"2": {
-				State:       &testStruct{A: "state"},
-				BeforeNodes: []string{"4"},
+				State:           &testStruct{A: "state"},
+				BeforeNodes:     []string{"4"},
+				RerunNodesExtra: make(map[string]interface{}),
+				SubGraphs:       make(map[string]*InterruptInfo),
 			},
 		},
 	}, info)
@@ -776,7 +831,7 @@ func TestRerunNodeInterrupt(t *testing.T) {
 	err := g.AddLambdaNode("1", InvokableLambda(func(ctx context.Context, input string) (output string, err error) {
 		defer func() { times++ }()
 		if times%2 == 0 {
-			return "", InterruptAndRerun
+			return "", NewInterruptAndRerunErr("test extra")
 		}
 		return input, nil
 	}), WithStatePreHandler(func(ctx context.Context, in string, state *testStruct) (string, error) {
@@ -809,6 +864,7 @@ func TestRerunNodeInterrupt(t *testing.T) {
 	info, existed = ExtractInterruptInfo(err)
 	assert.True(t, existed)
 	assert.Equal(t, []string{"1"}, info.RerunNodes)
+	assert.Equal(t, "test extra", info.RerunNodesExtra["1"].(string))
 
 	streamResult, err := r.Stream(ctx, "", WithCheckPointID("2"), WithStateModifier(func(ctx context.Context, path NodePath, state any) error {
 		state.(*testStruct).A = "state"
@@ -820,6 +876,36 @@ func TestRerunNodeInterrupt(t *testing.T) {
 	assert.Equal(t, "state", chunk)
 	_, err = streamResult.Recv()
 	assert.Equal(t, io.EOF, err)
+}
+
+type myInterface interface {
+	A()
+}
+
+func TestInterfaceResume(t *testing.T) {
+	g := NewGraph[myInterface, string]()
+	times := 0
+	assert.NoError(t, g.AddLambdaNode("1", InvokableLambda(func(ctx context.Context, input myInterface) (output string, err error) {
+		if times == 0 {
+			times++
+			return "", NewInterruptAndRerunErr("test extra")
+		}
+		return "success", nil
+	})))
+	assert.NoError(t, g.AddEdge(START, "1"))
+	assert.NoError(t, g.AddEdge("1", END))
+
+	ctx := context.Background()
+	r, err := g.Compile(ctx, WithCheckPointStore(newInMemoryStore()))
+	assert.NoError(t, err)
+
+	_, err = r.Invoke(ctx, nil, WithCheckPointID("1"))
+	info, existed := ExtractInterruptInfo(err)
+	assert.True(t, existed)
+	assert.Equal(t, []string{"1"}, info.RerunNodes)
+	result, err := r.Invoke(ctx, nil, WithCheckPointID("1"))
+	assert.NoError(t, err)
+	assert.Equal(t, "success", result)
 }
 
 func TestEarlyFailCallback(t *testing.T) {
@@ -868,4 +954,33 @@ func TestGraphStartInterrupt(t *testing.T) {
 	result, err := r.Invoke(ctx, "", WithCheckPointID("1"))
 	assert.NoError(t, err)
 	assert.Equal(t, "input1sub1", result)
+}
+
+func TestWithForceNewRun(t *testing.T) {
+	g := NewGraph[string, string]()
+	_ = g.AddLambdaNode("1", InvokableLambda(func(ctx context.Context, input string) (output string, err error) {
+		return input + "1", nil
+	}))
+	_ = g.AddEdge(START, "1")
+	_ = g.AddEdge("1", END)
+	ctx := context.Background()
+	r, err := g.Compile(ctx, WithCheckPointStore(&failStore{t: t}))
+	assert.NoError(t, err)
+	result, err := r.Invoke(ctx, "input", WithCheckPointID("1"), WithForceNewRun())
+	assert.NoError(t, err)
+	assert.Equal(t, "input1", result)
+}
+
+type failStore struct {
+	t *testing.T
+}
+
+func (f *failStore) Get(ctx context.Context, checkPointID string) ([]byte, bool, error) {
+	f.t.Fatalf("cannot call store")
+	return nil, false, errors.New("fail")
+}
+
+func (f *failStore) Set(ctx context.Context, checkPointID string, checkPoint []byte) error {
+	f.t.Fatalf("cannot call store")
+	return errors.New("fail")
 }

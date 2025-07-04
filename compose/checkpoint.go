@@ -18,13 +18,10 @@ package compose
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/cloudwego/eino/internal/serialization"
 )
-
-var InterruptAndRerun = errors.New("interrupt and rerun")
 
 // RegisterSerializableType registers a custom type for eino serialization.
 // This allows eino to properly serialize and deserialize custom types.
@@ -57,6 +54,13 @@ func WithCheckPointID(checkPointID string) Option {
 	}
 }
 
+// WithForceNewRun forces the graph to run from the beginning, ignoring any checkpoints.
+func WithForceNewRun() Option {
+	return Option{
+		forceNewRun: true,
+	}
+}
+
 type StateModifier func(ctx context.Context, path NodePath, state any) error
 
 func WithStateModifier(sm StateModifier) Option {
@@ -70,6 +74,8 @@ type checkpoint struct {
 	Inputs         map[string] /*node key*/ any /*input*/
 	State          any
 	SkipPreHandler map[string]bool
+
+	ToolsNodeExecutedTools map[string] /*tool node key*/ map[string] /*tool call id*/ string
 
 	SubGraphs map[string]*checkpoint
 }
@@ -137,6 +143,7 @@ func forwardCheckPoint(ctx context.Context, nodeKey string) context.Context {
 		return ctx
 	}
 	if subCP, ok := cp.SubGraphs[nodeKey]; ok {
+		delete(cp.SubGraphs, nodeKey) // only forward once
 		return context.WithValue(ctx, checkPointKey{}, subCP)
 	}
 	return context.WithValue(ctx, checkPointKey{}, (*checkpoint)(nil))

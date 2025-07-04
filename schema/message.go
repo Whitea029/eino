@@ -303,8 +303,13 @@ type Message struct {
 
 	// only for ToolMessage
 	ToolCallID string `json:"tool_call_id,omitempty"`
+	// only for ToolMessage
+	ToolName string `json:"tool_name,omitempty"`
 
 	ResponseMeta *ResponseMeta `json:"response_meta,omitempty"`
+
+	// ReasoningContent is the thinking process of the model, which will be included when the model returns reasoning content.
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 
 	// customized information for model implementation
 	Extra map[string]any `json:"extra,omitempty"`
@@ -439,6 +444,11 @@ func (m *Message) Format(_ context.Context, vs map[string]any, formatType Format
 	copied := *m
 	copied.Content = c
 
+	if len(m.MultiContent) != 0 {
+		copied.MultiContent = make([]ChatMessagePart, len(m.MultiContent))
+		copy(copied.MultiContent, m.MultiContent)
+	}
+
 	for i, mc := range copied.MultiContent {
 		if len(mc.Text) > 0 {
 			nmc, err := formatContent(mc.Text, vs, formatType)
@@ -473,6 +483,9 @@ func (m *Message) String() string {
 	}
 	if m.ToolCallID != "" {
 		s += fmt.Sprintf("\ntool_call_id: %s", m.ToolCallID)
+	}
+	if m.ToolName != "" {
+		s += fmt.Sprintf("\ntool_call_name: %s", m.ToolName)
 	}
 	if m.ResponseMeta != nil {
 		s += fmt.Sprintf("\nfinish_reason: %s", m.ResponseMeta.FinishReason)
@@ -509,12 +522,31 @@ func UserMessage(content string) *Message {
 	}
 }
 
+type toolMessageOptions struct {
+	toolName string
+}
+
+// ToolMessageOption defines a option for ToolMessage
+type ToolMessageOption func(*toolMessageOptions)
+
+// WithToolName returns a ToolMessageOption that sets the tool call name.
+func WithToolName(name string) ToolMessageOption {
+	return func(o *toolMessageOptions) {
+		o.toolName = name
+	}
+}
+
 // ToolMessage represents a message with Role "tool".
-func ToolMessage(content string, toolCallID string) *Message {
+func ToolMessage(content string, toolCallID string, opts ...ToolMessageOption) *Message {
+	o := &toolMessageOptions{}
+	for _, opt := range opts {
+		opt(o)
+	}
 	return &Message{
 		Role:       Tool,
 		Content:    content,
 		ToolCallID: toolCallID,
+		ToolName:   o.toolName,
 	}
 }
 
@@ -621,11 +653,13 @@ func concatToolCalls(chunks []ToolCall) ([]ToolCall, error) {
 // concatedMsg, err := ConcatMessages(msgs) // concatedMsg.Content will be full content of all messages
 func ConcatMessages(msgs []*Message) (*Message, error) {
 	var (
-		contents   []string
-		contentLen int
-		toolCalls  []ToolCall
-		ret        = Message{}
-		extraList  = make([]map[string]any, 0, len(msgs))
+		contents            []string
+		contentLen          int
+		reasoningContents   []string
+		reasoningContentLen int
+		toolCalls           []ToolCall
+		ret                 = Message{}
+		extraList           = make([]map[string]any, 0, len(msgs))
 	)
 
 	for idx, msg := range msgs {
@@ -659,10 +693,22 @@ func ConcatMessages(msgs []*Message) (*Message, error) {
 					" different toolCallIDs: '%s' '%s'", ret.ToolCallID, msg.ToolCallID)
 			}
 		}
+		if msg.ToolName != "" {
+			if ret.ToolName == "" {
+				ret.ToolName = msg.ToolName
+			} else if ret.ToolName != msg.ToolName {
+				return nil, fmt.Errorf("cannot concat messages with"+
+					" different toolNames: '%s' '%s'", ret.ToolCallID, msg.ToolCallID)
+			}
+		}
 
 		if msg.Content != "" {
 			contents = append(contents, msg.Content)
 			contentLen += len(msg.Content)
+		}
+		if msg.ReasoningContent != "" {
+			reasoningContents = append(reasoningContents, msg.ReasoningContent)
+			reasoningContentLen += len(msg.ReasoningContent)
 		}
 
 		if len(msg.ToolCalls) > 0 {
@@ -719,7 +765,6 @@ func ConcatMessages(msgs []*Message) (*Message, error) {
 	if len(contents) > 0 {
 		var sb strings.Builder
 		sb.Grow(contentLen)
-		sb.WriteString(ret.Content)
 		for _, content := range contents {
 			_, err := sb.WriteString(content)
 			if err != nil {
@@ -728,6 +773,18 @@ func ConcatMessages(msgs []*Message) (*Message, error) {
 		}
 
 		ret.Content = sb.String()
+	}
+	if len(reasoningContents) > 0 {
+		var sb strings.Builder
+		sb.Grow(reasoningContentLen)
+		for _, rc := range reasoningContents {
+			_, err := sb.WriteString(rc)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		ret.ReasoningContent = sb.String()
 	}
 
 	if len(toolCalls) > 0 {

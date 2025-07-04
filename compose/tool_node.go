@@ -31,8 +31,9 @@ import (
 )
 
 type toolsNodeOptions struct {
-	ToolOptions []tool.Option
-	ToolList    []tool.BaseTool
+	ToolOptions   []tool.Option
+	ToolList      []tool.BaseTool
+	executedTools map[string]string
 }
 
 // ToolsNodeOption is the option func type for ToolsNode.
@@ -52,14 +53,21 @@ func WithToolList(tool ...tool.BaseTool) ToolsNodeOption {
 	}
 }
 
+func withExecutedTools(executedTools map[string]string) ToolsNodeOption {
+	return func(o *toolsNodeOptions) {
+		o.executedTools = executedTools
+	}
+}
+
 // ToolsNode a node that can run tools in a graph. the interface in Graph Node as below:
 //
 //	Invoke(ctx context.Context, input *schema.Message, opts ...ToolsNodeOption) ([]*schema.Message, error)
 //	Stream(ctx context.Context, input *schema.Message, opts ...ToolsNodeOption) (*schema.StreamReader[[]*schema.Message], error)
 type ToolsNode struct {
-	tuple               *toolsTuple
-	unknownToolHandler  func(ctx context.Context, name, input string) (string, error)
-	executeSequentially bool
+	tuple                *toolsTuple
+	unknownToolHandler   func(ctx context.Context, name, input string) (string, error)
+	executeSequentially  bool
+	toolArgumentsHandler func(ctx context.Context, name, input string) (string, error)
 }
 
 // ToolsNodeConfig is the config for ToolsNode.
@@ -84,6 +92,17 @@ type ToolsNodeConfig struct {
 	// When set to true, tool calls will be executed one after another in the order they appear in the input message.
 	// When set to false (default), tool calls will be executed in parallel.
 	ExecuteSequentially bool
+
+	// ToolArgumentsHandler allows handling of tool arguments before execution.
+	// When provided, this function will be called for each tool call to process the arguments.
+	// Parameters:
+	//   - ctx: The context for the tool call
+	//   - name: The name of the tool being called
+	//   - arguments: The original arguments string for the tool
+	// Returns:
+	//   - string: The processed arguments string to be used for tool execution
+	//   - error: Any error that occurred during preprocessing
+	ToolArgumentsHandler func(ctx context.Context, name, arguments string) (string, error)
 }
 
 // NewToolNode creates a new ToolsNode.
@@ -100,10 +119,18 @@ func NewToolNode(ctx context.Context, conf *ToolsNodeConfig) (*ToolsNode, error)
 	}
 
 	return &ToolsNode{
-		tuple:               tuple,
-		unknownToolHandler:  conf.UnknownToolsHandler,
-		executeSequentially: conf.ExecuteSequentially,
+		tuple:                tuple,
+		unknownToolHandler:   conf.UnknownToolsHandler,
+		executeSequentially:  conf.ExecuteSequentially,
+		toolArgumentsHandler: conf.ToolArgumentsHandler,
 	}, nil
+}
+
+type ToolsInterruptAndRerunExtra struct {
+	ToolCalls     []schema.ToolCall
+	ExecutedTools map[string]string
+	RerunTools    []string
+	RerunExtraMap map[string]any
 }
 
 type toolsTuple struct {
@@ -125,7 +152,6 @@ func convTools(ctx context.Context, tools []tool.BaseTool) (*toolsTuple, error) 
 		}
 
 		toolName := tl.Name
-
 		var (
 			st tool.StreamableTool
 			it tool.InvokableTool
@@ -172,12 +198,13 @@ type toolCallTask struct {
 	callID string
 
 	// out
-	output  string
-	sOutput *schema.StreamReader[string]
-	err     error
+	executed bool
+	output   string
+	sOutput  *schema.StreamReader[string]
+	err      error
 }
 
-func (tn *ToolsNode) genToolCallTasks(tuple *toolsTuple, input *schema.Message) ([]toolCallTask, error) {
+func (tn *ToolsNode) genToolCallTasks(ctx context.Context, tuple *toolsTuple, input *schema.Message, executedTools map[string]string, isStream bool) ([]toolCallTask, error) {
 	if input.Role != schema.Assistant {
 		return nil, fmt.Errorf("expected message role is Assistant, got %s", input.Role)
 	}
@@ -191,6 +218,18 @@ func (tn *ToolsNode) genToolCallTasks(tuple *toolsTuple, input *schema.Message) 
 
 	for i := 0; i < n; i++ {
 		toolCall := input.ToolCalls[i]
+		if result, executed := executedTools[toolCall.ID]; executed {
+			toolCallTasks[i].name = toolCall.Function.Name
+			toolCallTasks[i].arg = toolCall.Function.Arguments
+			toolCallTasks[i].callID = toolCall.ID
+			toolCallTasks[i].executed = true
+			if isStream {
+				toolCallTasks[i].sOutput = schema.StreamReaderFromArray([]string{result})
+			} else {
+				toolCallTasks[i].output = result
+			}
+			continue
+		}
 		index, ok := tuple.indexes[toolCall.Function.Name]
 		if !ok {
 			if tn.unknownToolHandler == nil {
@@ -201,8 +240,16 @@ func (tn *ToolsNode) genToolCallTasks(tuple *toolsTuple, input *schema.Message) 
 			toolCallTasks[i].r = tuple.rps[index]
 			toolCallTasks[i].meta = tuple.meta[index]
 			toolCallTasks[i].name = toolCall.Function.Name
-			toolCallTasks[i].arg = toolCall.Function.Arguments
 			toolCallTasks[i].callID = toolCall.ID
+			if tn.toolArgumentsHandler != nil {
+				arg, err := tn.toolArgumentsHandler(ctx, toolCall.Function.Name, toolCall.Function.Arguments)
+				if err != nil {
+					return nil, fmt.Errorf("failed to executed tool[name:%s arguments:%s] arguments handler: %w", toolCall.Function.Name, toolCall.Function.Arguments, err)
+				}
+				toolCallTasks[i].arg = arg
+			} else {
+				toolCallTasks[i].arg = toolCall.Function.Arguments
+			}
 		}
 	}
 
@@ -226,6 +273,9 @@ func newUnknownToolTask(name, arg, callID string, unknownToolHandler func(ctx co
 }
 
 func runToolCallTaskByInvoke(ctx context.Context, task *toolCallTask, opts ...tool.Option) {
+	if task.executed {
+		return
+	}
 	ctx = callbacks.ReuseHandlers(ctx, &callbacks.RunInfo{
 		Name:      task.name,
 		Type:      task.meta.componentImplType,
@@ -233,8 +283,10 @@ func runToolCallTaskByInvoke(ctx context.Context, task *toolCallTask, opts ...to
 	})
 
 	ctx = setToolCallInfo(ctx, &toolCallInfo{toolCallID: task.callID})
-
-	task.output, task.err = task.r.Invoke(ctx, task.arg, opts...) // nolint: byted_returned_err_should_do_check
+	task.output, task.err = task.r.Invoke(ctx, task.arg, opts...)
+	if task.err == nil {
+		task.executed = true
+	}
 }
 
 func runToolCallTaskByStream(ctx context.Context, task *toolCallTask, opts ...tool.Option) {
@@ -245,12 +297,17 @@ func runToolCallTaskByStream(ctx context.Context, task *toolCallTask, opts ...to
 	})
 
 	ctx = setToolCallInfo(ctx, &toolCallInfo{toolCallID: task.callID})
-
-	task.sOutput, task.err = task.r.Stream(ctx, task.arg, opts...) // nolint: byted_returned_err_should_do_check
+	task.sOutput, task.err = task.r.Stream(ctx, task.arg, opts...)
+	if task.err == nil {
+		task.executed = true
+	}
 }
 
 func sequentialRunToolCall(ctx context.Context, run func(ctx2 context.Context, callTask *toolCallTask, opts ...tool.Option), tasks []toolCallTask, opts ...tool.Option) {
 	for i := 0; i < len(tasks); i++ {
+		if tasks[i].executed {
+			continue
+		}
 		run(ctx, &tasks[i], opts...)
 	}
 }
@@ -265,6 +322,9 @@ func parallelRunToolCall(ctx context.Context,
 
 	var wg sync.WaitGroup
 	for i := 1; i < len(tasks); i++ {
+		if tasks[i].executed {
+			continue
+		}
 		wg.Add(1)
 		go func(ctx_ context.Context, t *toolCallTask, opts ...tool.Option) {
 			defer wg.Done()
@@ -297,7 +357,7 @@ func (tn *ToolsNode) Invoke(ctx context.Context, input *schema.Message,
 		}
 	}
 
-	tasks, err := tn.genToolCallTasks(tuple, input)
+	tasks, err := tn.genToolCallTasks(ctx, tuple, input, opt.executedTools, false)
 	if err != nil {
 		return nil, err
 	}
@@ -310,12 +370,32 @@ func (tn *ToolsNode) Invoke(ctx context.Context, input *schema.Message,
 
 	n := len(tasks)
 	output := make([]*schema.Message, n)
+	rerunExtra := &ToolsInterruptAndRerunExtra{
+		ToolCalls:     input.ToolCalls,
+		ExecutedTools: make(map[string]string),
+		RerunExtraMap: make(map[string]any),
+	}
+	rerun := false
 	for i := 0; i < n; i++ {
 		if tasks[i].err != nil {
-			return nil, fmt.Errorf("failed to invoke tool[name:%s id:%s]: %w", tasks[i].name, tasks[i].callID, tasks[i].err)
+			extra, ok := IsInterruptRerunError(tasks[i].err)
+			if !ok {
+				return nil, fmt.Errorf("failed to invoke tool[name:%s id:%s]: %w", tasks[i].name, tasks[i].callID, tasks[i].err)
+			}
+			rerun = true
+			rerunExtra.RerunTools = append(rerunExtra.RerunTools, tasks[i].callID)
+			rerunExtra.RerunExtraMap[tasks[i].callID] = extra
+			continue
 		}
-
-		output[i] = schema.ToolMessage(tasks[i].output, tasks[i].callID)
+		if tasks[i].executed {
+			rerunExtra.ExecutedTools[tasks[i].callID] = tasks[i].output
+		}
+		if !rerun {
+			output[i] = schema.ToolMessage(tasks[i].output, tasks[i].callID, schema.WithToolName(tasks[i].name))
+		}
+	}
+	if rerun {
+		return nil, NewInterruptAndRerunErr(rerunExtra)
 	}
 
 	return output, nil
@@ -336,7 +416,7 @@ func (tn *ToolsNode) Stream(ctx context.Context, input *schema.Message,
 		}
 	}
 
-	tasks, err := tn.genToolCallTasks(tuple, input)
+	tasks, err := tn.genToolCallTasks(ctx, tuple, input, opt.executedTools, true)
 	if err != nil {
 		return nil, err
 	}
@@ -348,25 +428,57 @@ func (tn *ToolsNode) Stream(ctx context.Context, input *schema.Message,
 	}
 
 	n := len(tasks)
-	sOutput := make([]*schema.StreamReader[[]*schema.Message], n)
 
+	rerun := false
+	rerunExtra := &ToolsInterruptAndRerunExtra{
+		ToolCalls:     input.ToolCalls,
+		RerunExtraMap: make(map[string]any),
+		ExecutedTools: make(map[string]string),
+	}
+
+	// check rerun
 	for i := 0; i < n; i++ {
 		if tasks[i].err != nil {
-			return nil, fmt.Errorf("failed to stream tool call %s: %w", tasks[i].callID, tasks[i].err)
+			extra, ok := IsInterruptRerunError(tasks[i].err)
+			if !ok {
+				return nil, fmt.Errorf("failed to stream tool call %s: %w", tasks[i].callID, tasks[i].err)
+			}
+			rerun = true
+			rerunExtra.RerunTools = append(rerunExtra.RerunTools, tasks[i].callID)
+			rerunExtra.RerunExtraMap[tasks[i].callID] = extra
+			continue
 		}
+	}
 
+	if rerun {
+		// concat and save tool output
+		for _, t := range tasks {
+			if t.executed {
+				o, err := concatStreamReader(t.sOutput)
+				if err != nil {
+					return nil, fmt.Errorf("failed to concat tool[name:%s id:%s]'s stream output: %w", t.name, t.callID, err)
+				}
+				rerunExtra.ExecutedTools[t.callID] = o
+			}
+		}
+		return nil, NewInterruptAndRerunErr(rerunExtra)
+	}
+
+	// common return
+	sOutput := make([]*schema.StreamReader[[]*schema.Message], n)
+	for i := 0; i < n; i++ {
 		index := i
 		callID := tasks[i].callID
+		callName := tasks[i].name
 		convert := func(s string) ([]*schema.Message, error) {
 			ret := make([]*schema.Message, n)
-			ret[index] = schema.ToolMessage(s, callID)
+			ret[index] = schema.ToolMessage(s, callID, schema.WithToolName(callName))
 
 			return ret, nil
 		}
 
 		sOutput[i] = schema.StreamReaderWithConvert(tasks[i].sOutput, convert)
 	}
-
 	return schema.MergeStreamReaders(sOutput), nil
 }
 

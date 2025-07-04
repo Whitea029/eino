@@ -454,10 +454,6 @@ func (g *graph) addBranch(startNode string, branch *GraphBranch, skipData bool) 
 		return fmt.Errorf("branch start node '%s' needs to be added to graph first", startNode)
 	}
 
-	if len(branch.endNodes) == 1 {
-		return fmt.Errorf("number of branches is 1")
-	}
-
 	if _, ok := g.handlerPreBranch[startNode]; !ok {
 		g.handlerPreBranch[startNode] = [][]handlerPair{}
 	}
@@ -472,7 +468,7 @@ func (g *graph) addBranch(startNode string, branch *GraphBranch, skipData bool) 
 	// check branch condition type
 	result := checkAssignable(g.getNodeOutputType(startNode), branch.inputType)
 	if result == assignableTypeMustNot {
-		return fmt.Errorf("condition input type[%s] and start node output type[%s] are mismatched", branch.inputType.String(), g.getNodeOutputType(startNode).String())
+		return fmt.Errorf("condition's input type[%s] and start node[%s]'s output type[%s] are mismatched", branch.inputType.String(), startNode, g.getNodeOutputType(startNode).String())
 	} else if result == assignableTypeMay {
 		g.handlerPreBranch[startNode] = append(g.handlerPreBranch[startNode], []handlerPair{branch.inputConverter})
 	} else {
@@ -567,19 +563,21 @@ func (g *graph) updateToValidateMap() error {
 					if _, ok := g.handlerOnEdges[startNode]; !ok {
 						g.handlerOnEdges[startNode] = make(map[string][]handlerPair)
 					}
-					g.handlerOnEdges[startNode][endNode.endNode] = append(g.handlerOnEdges[startNode][endNode.endNode], handlerPair{
-						invoke: func(value any) (any, error) {
-							return fieldMap(endNode.mappings, false)(value)
-						},
-						transform: streamFieldMap(endNode.mappings),
-					})
 					g.fieldMappingRecords[endNode.endNode] = append(g.fieldMappingRecords[endNode.endNode], endNode.mappings...)
 
 					// field mapping check
-					checker, err := validateFieldMapping(g.getNodeOutputType(startNode), g.getNodeInputType(endNode.endNode), endNode.mappings)
+					checker, uncheckedSourcePaths, err := validateFieldMapping(g.getNodeOutputType(startNode), g.getNodeInputType(endNode.endNode), endNode.mappings)
 					if err != nil {
 						return err
 					}
+
+					g.handlerOnEdges[startNode][endNode.endNode] = append(g.handlerOnEdges[startNode][endNode.endNode], handlerPair{
+						invoke: func(value any) (any, error) {
+							return fieldMap(endNode.mappings, false, uncheckedSourcePaths)(value)
+						},
+						transform: streamFieldMap(endNode.mappings, uncheckedSourcePaths),
+					})
+
 					if checker != nil {
 						g.handlerOnEdges[startNode][endNode.endNode] = append(g.handlerOnEdges[startNode][endNode.endNode], *checker)
 					}
@@ -639,7 +637,7 @@ func (g *graph) compile(ctx context.Context, opt *graphCompileOptions) (*composa
 	cb := pregelChannelBuilder
 	if isChain(g.cmp) || isWorkflow(g.cmp) {
 		if opt != nil && opt.nodeTriggerMode != "" {
-			return nil, errors.New("chain doesn't support node trigger mode option")
+			return nil, errors.New(fmt.Sprintf("%s doesn't support node trigger mode option", g.cmp))
 		}
 	}
 	if (opt != nil && opt.nodeTriggerMode == AllPredecessor) || isWorkflow(g.cmp) {
@@ -764,6 +762,14 @@ func (g *graph) compile(ctx context.Context, opt *graphCompileOptions) (*composa
 	}
 	copy(inputChannels.writeToBranches, g.branches[START])
 
+	var mergeConfigs map[string]FanInMergeConfig
+	if opt != nil {
+		mergeConfigs = opt.mergeConfigs
+	}
+	if mergeConfigs == nil {
+		mergeConfigs = make(map[string]FanInMergeConfig)
+	}
+
 	r := &runner{
 		chanSubscribeTo:     chanSubscribeTo,
 		controlPredecessors: controlPredecessors,
@@ -782,6 +788,8 @@ func (g *graph) compile(ctx context.Context, opt *graphCompileOptions) (*composa
 		preBranchHandlerManager: &preBranchHandlerManager{h: g.handlerPreBranch},
 		preNodeHandlerManager:   &preNodeHandlerManager{h: g.handlerPreNode},
 		edgeHandlerManager:      &edgeHandlerManager{h: g.handlerOnEdges},
+
+		mergeConfigs: mergeConfigs,
 	}
 
 	successors := make(map[string][]string)
